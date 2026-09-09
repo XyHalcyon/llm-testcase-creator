@@ -1,0 +1,11 @@
+python gen_data_4k_unique.py \
+  --gsm8k-path "./GSM8K.jsonl" \
+  --tokenizer "/apps/models/DeepSeek-V4-Flash/" \
+  --num-requests 2870 \
+  --cache-hit-rate 0.15 \
+  --kv-block-size 128 \
+  --concurrency 287 \
+  --min-chains 3 \
+  --chain-gap 0 \
+  --format evalscope \
+  --rate 4
