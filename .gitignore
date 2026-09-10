@@ -1,0 +1,124 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+*.manifest
+dist/
+build/
+develop/
+*.whl
+__pyinstaller/
+pip-wheel-metadata/
+pip-log.txt
+pip-delete.txt
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+.env.*
+.eggs/
+*.spec
+
+# Package managers
+.tox/
+.nox/
+.pdm-python/
+.pdm.bak/
+__pypackages__/
+
+# Coverage & Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+.pytype_cache/
+.mypy_cache/
+.dmypy.json
+.pyright/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch / ML models & weights
+*.pt
+*.pth
+*.onnx
+*.h5
+*.safetensors
+*.ckpt
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.bin
+
+# TensorFlow
+*.tfrecord
+*.tfr
+events.out.*
+tf_events.*
+tfevents.out.*
+
+# Hugging Face
+*.wbf
+
+# Node.js
+node_modules/
+.npm-debug.log*
+yarn-error.log
+pnpm-debug.log*
+.pnpm-store/
+.node_repl_history
+*.tsbuildinfo
+.next/
+.vercel/
+
+# Vim swap files
+*.swp
+*.swo
+
+# Data & cache
+*.log
+*.tmp
+*.bak
+*.cache
+*.pid
+*.seed
+*.sock
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+*.suo
+.history
+.devcontainer/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Trashes
+
+# Docker
+.dockerignore
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.tfplan
+.auto.tfvars.json
+
+# Project
+.omo/
+**/*tokenizer
