@@ -4,7 +4,7 @@
 
 关键参数说明 (渐进式前缀链模式):
   - max_tokens=None: 必须为 None, 让数据里每行自带的 max_tokens 生效。
-    (EvalScope 全局 max_tokens 默认 2048 会覆盖每行的值; 设 14050 会使 priming
+    (EvalScope 全局 max_tokens 默认 2048 会覆盖每行的值; 设 837 会使 priming
     阶段也生成该长度, 完全失去 priming 意义。evalscope 1.9.0 实测通过)
   - rate=N (N>0): 必须用固定速率模式。rate=-1 (闭环并发) 会使 stage 时序不可控,
     后阶可能在前阶 prefill 完成前到达, 导致缓存未命中。
@@ -19,12 +19,12 @@ args = Arguments(
     api="openai",
     url="http://<HOST>:<PORT>/v1/chat/completions",
     dataset="mixed",
-    dataset_path='/workspace/llm-testcase-creator/ds-v4-12k/gsm8k_4k_12k_c128_cache25_20260910_072644_53b9b8de.jsonl',
+    dataset_path='/workspace/llm-testcase-creator/ds-v4-12k/gsm8k_4k_12k_c128_cache25_20260915_081639_43c7ded8.jsonl',
     tokenizer_path="<tokenizer 或权重目录>",
-    number=4878,
+    number=3798,
     parallel=128,
     rate=4.000000,        # 渐进链模式: 必须用 rate=N (N>0); rate=-1 会破坏 stage 时序
-    max_tokens=None,      # 别改: None 才逐请求生效 (priming=16, target=14050)
+    max_tokens=None,      # 别改: None 才逐请求生效 (priming=16, target=837/528)
     stream=True,
     name="mix_perf",
 )
