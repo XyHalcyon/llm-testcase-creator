@@ -1,21 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-gen_data_4k_12k.py — 生成 DeepSeek V4 Flash 性能压测用的 GSM8K 混合序列数据集 (12K + 渐进式前缀链)。
+gen_data_4k_12k.py — 生成 DeepSeek V4 Flash 性能压测用的 GSM8K 混合序列数据集 (混合长序列 + 渐进式前缀链)。
 
 融合两套架构:
-  - ds-v3.2-12k: 12K 重流量模型 (10 档长度, 平均输入 ~12349 / 输出 ~2056) + 块级批次隔离
+  - ds-v3.2-12k: 重流量模型 + 块级批次隔离
                  (共享区/正文区每个 128-token 块带 [shared-<batch>-<block>] / [body-<batch>-<rid>-<block>] 标记,
                   跨批完整块交集 = 0)。
+                 本版分布取自混合序列流量画像 (rr=5, 21机): 20 档长度, 平均输入 ~14.9K / 输出 ~355。
   - ds-v4-3k:    渐进式前缀链 (Progressive Prefix Chain) — 将最长桶的请求替换为多阶渐进链,
                  每阶是下一阶的严格 token 级前缀, 使后阶请求命中前阶 prefix cache, 降低 TTFT。
 
-本脚本对 42100 和 84200 两个长输入桶启用渐进式前缀链 (可通过 CHAIN_BUCKETS 常量或
+本脚本对 499835 和 728183 两个长输入桶启用渐进式前缀链 (可通过 CHAIN_BUCKETS 常量或
 --chain-buckets 参数配置哪些桶做链):
-  42100 桶: 7 阶链 (6k→12k→18k→24k→30k→36k→42100), 每轮约 6k 新内容
-  84200 桶: 7 阶链 (12k→24k→36k→48k→60k→72k→84200), 每轮约 12k 新内容
+  499835 桶: 7 阶链 (71k→143k→214k→286k→357k→428k→499835), 每轮约 71k 新内容
+  728183 桶: 7 阶链 (104k→208k→312k→416k→520k→624k→728183), 每轮约 104k 新内容
   - Stage 0-5: max_tokens=16 (priming, 触发 prefill 写缓存)
-  - Stage 6:   max_tokens=该桶目标输出长度 (42100桶=7000, 84200桶=14050)
+  - Stage 6:   max_tokens=该桶目标输出长度 (499835桶=837, 728183桶=528)
   每阶是下一阶的严格 token 级前缀, 链内 stage 间插入 gap 个普通请求间隔,
   确保前阶 prefill 完成后后阶才到达, 避免并发乱序破坏命中。
 
@@ -44,22 +45,34 @@ import sys
 from datetime import datetime
 
 # ---------------- 配置区 (按需直接改这里) ----------------
-# (input_tokens, output_tokens, percentage%)  — 取自 ds-v3.2-12k, 平均输入/输出≈12k/2k
+# (input_tokens, output_tokens, percentage%)  — 取自混合序列流量画像 (rr=5, 21机), 按输入长度升序 20 档。
+# 名义平均输入 ≈ 14.9K, 平均输出 ≈ 355。尾桶 3147/1045429 源报表显示 0.0% (四舍五入),
+# 此处按 0.01% 计入: 约 1 万条请求出现 1 条该超长输出 (~1M) 批处理请求; 0.00% 时它永远 0 条。
 DISTRIBUTION = [
-    (55,     10,      0.56),
-    (330,    55,      0.34),
-    (660,    110,     1.01),
-    (1320,   220,     9.00),
-    (2630,   440,    12.94),
-    (5266,   870,    15.69),
-    (10500,  1760,   28.35),
-    (21060,  3500,   26.55),
-    (42100,  7000,    5.23),
-    (84200,  14050,   0.34),
+    (125,     74,        6.09),
+    (622,     46,       12.95),
+    (999,     1218,      3.69),
+    (1643,    119,      31.31),
+    (2624,    167,      18.96),
+    (3147,    1045429,   0.01),
+    (4979,    184,       9.64),
+    (7299,    28067,     0.03),
+    (8958,    411,       2.94),
+    (18997,   533,       1.80),
+    (31130,   430,       2.37),
+    (46871,   528,       2.19),
+    (66476,   622,       2.15),
+    (90801,   668,       2.08),
+    (120954,  744,       1.66),
+    (162151,  835,       0.94),
+    (224544,  846,       0.54),
+    (344158,  636,       0.36),
+    (499835,  837,       0.18),
+    (728183,  528,       0.09),
 ]
-DEFAULT_NUM_REQUESTS = 2500    # 选 2500 让最小占比 0.34% 的桶也能分到 >=1 条
+DEFAULT_NUM_REQUESTS = 2500    # 选 2500 让 0.03% 桶分到 >=1 条 (0.01% 尾桶约 1 万条才出现 1 条)
 DEFAULT_CONCURRENCY  = 32
-DEFAULT_CACHE_RATE   = 0.25    # 12K 流量模型默认 25% 共享前缀
+DEFAULT_CACHE_RATE   = 0.25    # 混合序列流量模型默认 25% 共享前缀
 DEFAULT_SEED         = 42
 _ROTATE_PRIME        = 100003  # 让每条请求的 body 从不同偏移取, 保证互不相同
 
@@ -72,8 +85,8 @@ _ROTATE_PRIME        = 100003  # 让每条请求的 body 从不同偏移取, 保
 #   - stage_lengths 会被自动 floor 对齐到 --kv-block-size
 # 中间阶段 (非最后) 仅生成 16 tokens 输出 (priming), 最后阶段输出该桶的目标输出长度。
 DEFAULT_CHAIN_BUCKETS = [
-    (42100, [6000, 12000, 18000, 24000, 30000, 36000, 42100]),  # 每轮 ~6k 新内容
-    (84200, [12000, 24000, 36000, 48000, 60000, 72000, 84200]), # 每轮 ~12k 新内容
+    (499835, [71405, 142810, 214215, 285620, 357025, 428430, 499835]),  # 每轮 ~71k 新内容
+    (728183, [104026, 208052, 312078, 416104, 520130, 624156, 728183]), # 每轮 ~104k 新内容
 ]
 DEFAULT_CHAIN_NUM_STAGES        = 7      # CLI --chain-buckets 自动生成阶段时的阶段数
 DEFAULT_CHAIN_INTERMEDIATE_OUT = 16
@@ -285,7 +298,7 @@ class ProgressiveChainBuilder:
     """构造渐进式前缀链, 模拟 agent 多轮对话上下文增长。
 
     核心设计 (Oracle 审核通过):
-    1. [C1] shared_prefix 长度固定为 shared_len(84200), 不按每阶段长度计算 — 否则前缀链断裂。
+    1. [C1] shared_prefix 长度固定为 shared_len(链桶 target_len), 不按每阶段长度计算 — 否则前缀链断裂。
     2. [C2] 链阶段不含 [body-<batch>-<rid>-<block>] 标记 (该标记专门用于打断缓存) — 链内需保持前缀连续。
     3. [C3] 构造后必须验证 decode→encode 前缀一致性 (BPE 边界漂移检查)。
     4. [C5] 链阶段交错排列后禁止 shuffle — stage 顺序是缓存命中的关键。
@@ -297,8 +310,8 @@ class ProgressiveChainBuilder:
       - 跨批隔离由 12k Builder 的 batch_tag + 问题重排保证, 链段天然继承。
 
     构造方法:
-      1. 构建完整 84200 token 序列:
-         full_seq = [batch_marker(shared块)] [shared_prefix(固定=shared_len(84200))] [\\n] [chain_segments]
+      1. 构建完整 target_len (如 728183) token 序列:
+         full_seq = [batch_marker(shared块)] [shared_prefix(固定=shared_len(target_len))] [\\n] [chain_segments]
       2. Stage i = decode(full_seq[: (i+1) * stage_len])   ← token 级截断
       3. 验证: encode(Stage[i+1])[:len(encode(Stage[i]))] == encode(Stage[i])
     """
@@ -307,16 +320,16 @@ class ProgressiveChainBuilder:
         """
         Args:
             builder: 已初始化的 Builder 实例 (提供 tok, corpus, shared_ids, shared_len 等)
-            chain_stages: 阶段输入长度列表, 如 [12000, 24000, ..., 84200]
+            chain_stages: 阶段输入长度列表, 如 [104026, 208052, ..., 728183]
             block_size: KV block 大小, >0 时阶段边界对齐到块整数倍
         """
         self.b = builder
         self.tok = builder.tok
         self.stages = list(chain_stages)
         self.block = block_size
-        self.target_len = self.stages[-1]  # 最终目标长度 (如 84200)
+        self.target_len = self.stages[-1]  # 最终目标长度 (如 728183)
 
-        # [C1] 固定 shared_len = shared_len(84200), 所有阶段共用
+        # [C1] 固定 shared_len = shared_len(target_len), 所有阶段共用
         self.chain_shared_len = builder.shared_len(self.target_len)
 
         # 阶段长度对齐到 KV block (Oracle Q6: floor 对齐)
@@ -489,14 +502,14 @@ class MixedDataset(DatasetPluginBase):
                 yield request
 '''
 
-# 一键启动脚本 (V4 12K 版: rate=N, max_tokens=None, number 含 priming)
+# 一键启动脚本 (V4 混合序列版: rate=N, max_tokens=None, number 含 priming)
 _EVALSCOPE_RUNNER = '''# -*- coding: utf-8 -*-
 """一键跑 EvalScope perf(混合序列 + 逐请求输出长度)。
 改下面 model/url/tokenizer_path 后: python run_perf.py
 
 关键参数说明 (渐进式前缀链模式):
   - max_tokens=None: 必须为 None, 让数据里每行自带的 max_tokens 生效。
-    (EvalScope 全局 max_tokens 默认 2048 会覆盖每行的值; 设 14050 会使 priming
+    (EvalScope 全局 max_tokens 默认 2048 会覆盖每行的值; 设 837 会使 priming
     阶段也生成该长度, 完全失去 priming 意义。evalscope 1.9.0 实测通过)
   - rate=N (N>0): 必须用固定速率模式。rate=-1 (闭环并发) 会使 stage 时序不可控,
     后阶可能在前阶 prefill 完成前到达, 导致缓存未命中。
@@ -516,7 +529,7 @@ args = Arguments(
     number=%(number)d,
     parallel=%(parallel)d,
     rate=%(rate)f,        # 渐进链模式: 必须用 rate=N (N>0); rate=-1 会破坏 stage 时序
-    max_tokens=None,      # 别改: None 才逐请求生效 (priming=16, target=14050)
+    max_tokens=None,      # 别改: None 才逐请求生效 (priming=16, target=837/528)
     stream=True,
     name="mix_perf",
 )
@@ -549,7 +562,7 @@ def write_evalscope(requests, out_path, concurrency, rate):
 # ------------------------- 主流程 -------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="生成 DeepSeek V4 Flash 性能压测数据集 (GSM8K 12K 混合序列 + 渐进式前缀链)")
+        description="生成 DeepSeek V4 Flash 性能压测数据集 (GSM8K 混合长序列 + 渐进式前缀链)")
     ap.add_argument("--num-requests", type=int, default=DEFAULT_NUM_REQUESTS,
                     help="总请求数 (不含 priming; 默认 %d, 保证最稀有的桶>=1条)" % DEFAULT_NUM_REQUESTS)
     ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
@@ -589,7 +602,7 @@ def main():
     ap.add_argument("--min-chains", type=int, default=DEFAULT_MIN_CHAINS,
                     help="每个链桶的最少链数, 不足时自动提升 (默认 %d)" % DEFAULT_MIN_CHAINS)
     ap.add_argument("--no-chain", action="store_true",
-                    help="禁用渐进式前缀链, 降级为 12k 普通行为 (链桶改用普通请求)")
+                    help="禁用渐进式前缀链, 降级为普通混合序列行为 (链桶改用普通请求)")
     # ---- EvalScope 压测参数 ----
     ap.add_argument("--rate", type=float, default=4.0,
                     help="EvalScope rate 参数 (生成 run_perf.py 用; 渐进链模式必须 >0; 默认 %.1f)" % 4.0)
