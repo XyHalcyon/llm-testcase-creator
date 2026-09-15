@@ -122,3 +122,4 @@ $RECYCLE.BIN/
 # Project
 .omo/
 **/*tokenizer
+gsm8k_*.jsonl
