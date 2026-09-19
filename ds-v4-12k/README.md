@@ -1,179 +1,88 @@
-# DeepSeek V4 Flash 混合长序列数据集生成器（含渐进式前缀链）
+# DeepSeek V4 Flash 混合序列数据集生成器（预热 + 正式双文件）
 
-本目录融合 **ds-v3.2-12k**（重流量模型 + 块级批次隔离）与 **ds-v4-3k**（渐进式前缀链）两套架构，基于 GSM8K 问题生成 DeepSeek V4 Flash 性能压测数据集。
+本目录基于 GSM8K 问题生成 DeepSeek V4 Flash 性能压测数据集，采用**双文件模式**：
 
-- **混合序列流量**：20 档输入/输出长度，整体平均输入约 `14.9K tokens`、平均目标输出约 `355 tokens`（取自 rr=5/21机 真实流量画像）。
+- **预热文件**：只含各预热桶的前缀请求（长度 < 正式长度），**先跑**它把前缀 KV 写入服务端 prefix cache。
+- **正式文件**：20 档普通混合序列 + 预热桶的完整长度请求，**后跑**它——完整长度请求与预热请求 token 级前缀一致，命中预热写入的缓存，只需计算前缀之外的新增部分。
+
+核心特性：
+
+- **混合序列流量**：20 档输入/输出长度，整体平均输入约 `14.9K tokens`、平均目标输出约 `290 tokens`（取自 rr=5/21机 真实流量画像）。
 - **25% 共享前缀**（默认）：每条 prompt 前 25% 取自全局共享前缀。
 - **块级批次隔离**：共享区/正文区每个 128-token 块带 `[shared-<batch>-<block>]` / `[body-<batch>-<rid>-<block>]` 标记，跨批完整块交集 = 0。
-- **渐进式前缀链**（344158 + 499835 + 728183 三桶）：将三个长输入桶的请求替换为 7 阶渐进链，模拟 agent 多轮对话上下文累积增长，使长序列请求命中前阶 prefix cache，降低 TTFT。哪些桶做链可在 `CHAIN_BUCKETS` 常量或 `--chain-buckets` 参数中简单配置。
+- **预热/正式前缀对**：三桶 `(正式长度, 预热前缀长度)` = `(344158, 292864)` / `(499835, 448512)` / `(728183, 676864)`，正式长请求只需计算 ~51,200 token（400 个 128-block），其余命中预热缓存。
 
 生成器支持两种输出格式：
 
-- `evalscope`：OpenAI Chat Completions 请求格式，并自动生成 EvalScope 自定义数据集插件和运行脚本。
+- `evalscope`：OpenAI Chat Completions 请求格式，并自动生成 EvalScope 自定义数据集插件和两个运行脚本（预热 + 正式）。
 - `aisbench`：AISBench `qa` 自定义数据集格式。
 
-## 核心创新：渐进式前缀链（多桶）
+## 预热/正式前缀对（核心机制）
 
-### 设计动机
+### 设计目标
 
-在 agent 多轮对话场景中，上下文随对话轮次累积增长：第 1 轮 104k tokens，第 2 轮 208k tokens（前 104k 与第 1 轮相同），… 第 7 轮 728183 tokens（前 624k 与第 6 轮相同）。如果服务端开启 prefix cache，后阶请求应能命中前阶请求写入的 KV 缓存，显著降低 TTFT。
+正式测试中的超长请求（如 728183 token 输入）若无缓存命中，单条 prefill 需要数十秒。通过预热文件提前把长请求的**前缀部分**写入服务端 prefix cache，正式测试时长请求只需计算**前缀之外的新增量**（每桶统一 51,200 token = 400 个 128-block），TTFT 大幅下降。
 
-### 哪些桶做链（可配置）
+### 前缀对配置
 
-脚本默认对 **344158、499835 和 728183 三个长输入桶**启用渐进链。可通过两种方式配置：
-
-**方式一：改源码常量**（推荐，精细控制每桶阶段长度）
-
-修改 `gen_data_4k_12k.py` 顶部的 `CHAIN_BUCKETS` 常量，增删 entry 即可：
+修改 `gen_data_4k_12k.py` 顶部的 `WARMUP_PAIRS` 常量，增删 entry 即可：
 
 ```python
-CHAIN_BUCKETS = [
-    (344158, [49165, 98330, 147495, 196660, 245825, 294990, 344158]),  # 每轮 ~49k 新内容
-    (499835, [71405, 142810, 214215, 285620, 357025, 428430, 499835]),  # 每轮 ~71k 新内容
-    (728183, [104026, 208052, 312078, 416104, 520130, 624156, 728183]), # 每轮 ~104k 新内容
+WARMUP_PAIRS = [
+    (344158, 292864),   # 正式 344064 tok, 预热 292864 tok, 需计算 51200
+    (499835, 448512),   # 正式 499712 tok, 预热 448512 tok, 需计算 51200
+    (728183, 676864),   # 正式 728064 tok, 预热 676864 tok, 需计算 51200
 ]
 ```
 
-- 每条 entry：`(bucket_input_len, [stage_lengths])`
-- 约束：stages 必须严格递增且最后一阶 == bucket_input_len；所有链桶阶段数必须相同（交错排列约束）。
-- 注释掉或删除某行即可禁用该桶的链；添加新桶（须在 DISTRIBUTION 中）即可扩展。
+- 每条 entry：`(正式输入长度, 预热前缀长度)`
+- 约束：**只要求预热前缀长度 < 正式输入长度**；两个长度会自动 floor 对齐到 `--kv-block-size`（保证整块命中，无部分命中损耗）；正式输入长度必须存在于 `DISTRIBUTION`。
+- 也可通过 CLI 覆盖：`--warmup-pairs "344158:292864,499835:448512,728183:676864"`（格式 `正式:预热`）。
 
-**方式二：CLI 参数**（快速指定哪些桶做链，阶段自动均分）
+### 前缀一致性保证
 
-```bash
-# 只对 728183 桶做链 (阶段自动均分 7 阶 + block 对齐)
-python gen_data_4k_12k.py --chain-buckets 728183 ...
-
-# 对三桶都做链 (默认; 阶段用 CHAIN_BUCKETS 常量定义)
-python gen_data_4k_12k.py --chain-buckets 344158,499835,728183 ...
-
-# 禁用所有链
-python gen_data_4k_12k.py --no-chain ...
-```
-
-`--chain-buckets` 指定的桶若已在 `CHAIN_BUCKETS` 常量中定义阶段则直接复用；未定义的桶按 `--chain-num-stages`（默认 7）自动均分 + block 对齐生成阶段。
-
-### 链结构
-
-每个链桶的请求被替换为 7 阶渐进链：
+预热与正式文本由**同一次运行**生成：构造器先拼出完整的正式长度 token 序列
 
 ```
-344158 桶 (每轮 ~49k 新内容):
-  Stage 0: 49165 input  → max_tokens=16    (priming)
-  Stage 1: 98330 input  → max_tokens=16    (前 49k = Stage 0 + 49k 新内容)
-  ...
-  Stage 6: 344158 input → max_tokens=636   (目标请求, 前 295k = Stage 5 + 49k 新内容)
-
-499835 桶 (每轮 ~71k 新内容):
-  Stage 0: 71405 input  → max_tokens=16    (priming)
-  Stage 1: 142810 input → max_tokens=16    (前 71k = Stage 0 + 71k 新内容)
-  ...
-  Stage 6: 499835 input → max_tokens=837   (目标请求, 前 428k = Stage 5 + 71k 新内容)
-
-728183 桶 (每轮 ~104k 新内容):
-  Stage 0: 104026 input → max_tokens=16    (priming)
-  Stage 1: 208052 input → max_tokens=16    (前 104k = Stage 0 + 104k 新内容)
-  ...
-  Stage 6: 728183 input → max_tokens=528   (目标请求, 前 624k = Stage 5 + 104k 新内容)
+full_seq = [shared_prefix(=25%×正式长度, 含批次块标记)] [\n] [pair唯一语料段]
 ```
 
-每阶内容是下一阶的**严格 token 级前缀**。中间阶段（Stage 0-5）仅生成 16 tokens 输出（priming），目标阶段（Stage 6）输出该桶的目标输出长度（344158 桶 = 636，499835 桶 = 837，728183 桶 = 528）。
-
-### 内容构造
+然后按两个长度分别截断 decode：
 
 ```
-完整 bucket_len token 序列 = [shared_prefix(固定=25%×bucket_len, 含批次块标记)] [\n] [chain_unique_segments]
+预热文本 = decode(full_seq[:预热前缀长度])
+正式文本 = decode(full_seq[:正式长度])
 ```
 
-- **shared_prefix 长度固定**为 25% × 该桶长度（block 对齐后），该桶所有阶段共用。这是前缀链生效的关键。
-- **不插入 `[body-<batch>-<rid>-<block>]` 标记**：该标记在普通请求中用于打断缓存，在链内会破坏前缀连续性。
-- **\n 分隔符**：在 shared/segment 边界插入换行符，稳定分词边界。
-- **链间唯一性**：每条链用 `chain_idx × _ROTATE_PRIME` 计算不同语料偏移，保证不同链的 segment 内容不同。
-- **跨桶共享前缀兼容**：344158 桶的 shared_len (86016) < 499835 桶的 shared_len (124928) < 728183 桶的 shared_len (182016)，三者取自同一段 `shared_ids`，因此较短的 shared 段是较长 shared 段的前缀——短桶链的 priming 会预热长桶链 shared 段的前半部分，带来额外缓存命中。
+同一 token 序列两次截断 → 预热是正式的严格前缀（构造保证），并通过：
 
-### 前缀验证
+- **字符级断言**（`assert formal[:len(warmup)] == warmup`，失败即中断）
+- **token 级验证**（重新分词后校验前缀，捕获 BPE 边界漂移；极罕见，失败打印警告）
 
-构造后自动验证 `decode→encode` 前缀一致性（BPE 边界漂移检查）：重新分词每阶段文本，断言 Stage i 的 token 序列是 Stage i+1 的严格前缀。如发生漂移（极罕见），打印警告。
+两文件同 salt / 同语料偏移，跨文件一致性由构造保证，无静默失配风险。
 
-### 缓存命中分析
+### 命中比例与需计算量
 
-#### token 级前缀验证
+| 桶 | 正式长度 | 预热前缀 | 命中% | 需计算 | 需计算块 |
+|---|---:|---:|---:|---:|---:|
+| 344158 | 344,064 | 292,864 | 85.1% | 51,200 | 400 |
+| 499835 | 499,712 | 448,512 | 89.8% | 51,200 | 400 |
+| 728183 | 728,064 | 676,864 | 93.0% | 51,200 | 400 |
 
-用真实 V4 Flash tokenizer 对一条 344158 链（k=0）做 token 级前缀验证：
+调整预热前缀长度即可权衡：预热越短 → 预热越快，但正式命中率越低；预热越长 → 命中越高，但预热成本越大。
 
-```
-s0: 49051 tokens
-s1: 98119 tokens (前 49051 = s0)  ✓
-s2: 147271 tokens (前 98119 = s1)  ✓
-s3: 196423 tokens (前 147271 = s2)  ✓
-s4: 245575 tokens (前 196423 = s3)  ✓
-s5: 294727 tokens (前 245575 = s4)  ✓
-s6: 343879 tokens (前 294727 = s5)  ✓
-```
+### 运行前提（重要）
 
-所有 6 个 stage 转换的 token 级前缀完全匹配。
-
-#### BPE 边界漂移
-
-不同批次盐值可能导致截断点落在 BPE token 的中间字节，此时 `decode→encode` 非恒等，边界 1-2 个 token 不同（字符级前缀仍成立）。脚本 `_verify_prefix_chain` 会打印警告，影响仅限边界 1 个 KV block（<0.01%），不影响整体命中率。
-
-#### KV block 级命中分析
-
-服务端 KV cache 按 block（如 128 token）粒度管理。以 344158 链 s0→s1 为例：
-
-| block 范围 | tokens | s0 写入 | s1 命中 | 状态 |
-|:---:|---:|---:|---:|:---|
-| 0–382 | 0–49024 | 383 个完整 block | 383 个完整 block | ✅ 100% 命中 |
-| 383 | 49025–49151 | 前 26/128 token | 前 26 token 匹配 + 102 个新 token | ⚡ 部分命中（20%） |
-| 384–766 | 49152–98175 | 未写入 | 383 个全新 block | ❌ 全新计算 |
-
-各 stage 转换的理论命中率：
-
-| 阶段转换 | 总 token | 可命中 token | 理论命中率 |
-|:---:|---:|---:|---:|
-| s0→s1 | 49,051 + 49,068 | ≈ 49,025 | 98.7% |
-| s1→s2 | 98,119 + 49,152 | ≈ 98,047 | 98.9% |
-| s2→s3 | 147,271 + 49,152 | ≈ 147,199 | 98.8% |
-| s3→s4 | 196,423 + 49,152 | ≈ 196,351 | 98.8% |
-| s4→s5 | 245,575 + 49,152 | ≈ 245,503 | 98.8% |
-| s5→s6 | 294,727 + 49,152 | ≈ 294,655 | 98.8% |
-
-#### 缓存命中的前提条件
-
-缓存命中保证需要以下 4 个前提同时满足：
-
-| 前提 | 说明 |
-|---|---|
-| **同一实例 + 前缀缓存开启** | 链内请求必须被路由到同一 batch/实例，且服务端开启了 Prefix Caching（如 vLLM `--enable-prefix-caching`） |
-| **缓存未被驱逐** | s0→s1 之间有 gap 个普通请求 + 其他链的 stage 0 作为间隔，若缓存容量不足，s0 写入的 KV 可能被逐出 |
-| **请求发送时序受 `rate` 控制** | 必须用 `rate=N>0`（固定速率），不能用 `rate=-1`（闭环并发），否则 stage 到达顺序不可控 |
-| **KV block 大小一致** | 生成时 `--kv-block-size 128` 须与服务端实际的 KV block 大小一致 |
-
-### 交错排列
-
-测试脚本并发发送请求，如果 Stage 6（728183）和 Stage 0（104026）同时到达，Stage 6 无法命中 Stage 0 的缓存（Stage 0 尚未完成 prefill）。解决方案：**所有链桶的链统一交错排列，链内 stage 间插入 gap 个普通请求作为间隔**。
-
-```
-[gap×普通], 链A_s0, 链B_s0, ..., 链M_s0, [gap×普通], 链A_s1, 链B_s1, ..., 链M_s1, ..., 链A_s6, 链B_s6, ..., 链M_s6, [剩余普通]
-```
-
-其中链 A..M 包括 344158 桶的所有链、499835 桶的所有链和 728183 桶的所有链（同一 stage 组内混排，互相独立不依赖彼此缓存）。
-
-- `gap` 默认 = `--concurrency`，确保 Stage i 的 prefill 完成后 Stage i+1 才到达。
-- 同一 stage 的多条链请求紧挨发送。
-- **交错排列后禁止 shuffle**：stage 顺序是缓存命中机制的核心。
-- **所有链桶阶段数必须相同**（默认都是 7 阶），否则交错排列报错。
-
-### Stage 0 特殊情况
-
-当 `stage_len (49152) < shared_len (86016)` 时，344158 桶的 Stage 0 几乎完全由共享前缀组成。这是**可接受的行为**——Stage 0 仅预热共享前缀缓存，Stage 1+ 才添加唯一 segment 内容。由于普通请求也共享同一前缀，Stage 0 的缓存可能已被普通请求预热。
+1. **服务端 prefix cache 容量**必须能容纳全部预热 KV（≈ 前缀对组数 × 预热前缀长度 token），否则预热自逐出，正式测试无法命中。
+2. **预热与正式必须打到同一个服务实例**（实例重启缓存丢失）。
+3. **预热后尽快启动正式测试**，减少缓存被中间流量冲刷的窗口。
 
 ## 目录结构
 
 ```text
 ds-v4-12k/
 ├── GSM8K.jsonl                 # 基础问题数据，每行包含 question 和 answer
-├── gen_data_4k_12k.py          # 数据集生成脚本（含渐进式前缀链 + 块级批次隔离）
+├── gen_data_4k_12k.py          # 数据集生成脚本（双文件：预热 + 正式）
 ├── evalscope_mixed_plugin.py   # EvalScope 自定义数据集插件
 ├── gen_4k_12k.sh               # 便捷生成脚本
 └── README.md                   # 本说明文件
@@ -182,14 +91,16 @@ ds-v4-12k/
 执行生成脚本后，输出目录还会生成：
 
 ```text
-├── gsm8k_4k_12k_*.jsonl        # 生成的压测数据集
+├── warmup_prefix*.jsonl        # 预热文件
+├── gsm8k_4k_12k_*.jsonl        # 正式文件
 ├── evalscope_mixed_plugin.py   # format=evalscope 时生成或更新
-└── run_perf.py                 # EvalScope 压测启动模板（带实际参数）
+├── run_perf_warmup.py          # 预热 runner（先跑）
+└── run_perf.py                 # 正式 runner（后跑）
 ```
 
 ## 长度分布
 
-脚本内置以下输入/输出 token 分布（取自 rr=5/21机 混合序列流量画像，按输入长度升序 20 档），整体平均输入约 `14.9K tokens`、平均目标输出约 `355 tokens`。
+脚本内置以下输入/输出 token 分布（取自 rr=5/21机 混合序列流量画像，按输入长度升序 20 档），整体平均输入约 `14.9K tokens`、平均目标输出约 `290 tokens`。
 
 | 输入 token | 输出 token | 占比 |
 |---:|---:|---:|
@@ -214,79 +125,36 @@ ds-v4-12k/
 | 499,835 | 837 | 0.18% |
 | 728,183 | 528 | 0.09% |
 
-请求数量通过最大余数法分配到各长度档，最终条数严格等于 `--num-requests`。344158、499835 和 728183 桶的请求被替换为渐进链，链请求数 = 链数 × 7（含 priming），为额外请求。
+请求数量通过最大余数法分配到各长度档。三个预热桶（344158/499835/728183）在正式文件中由完整长度请求替代普通请求，并额外生成对应的预热文件请求。
 
-> 尾桶 `3147/1045429` 源报表显示 0.0%（四舍五入），此处按 0.01% 计入：约 1 万条请求出现 1 条超长输出（~1M token）批处理请求；`--num-requests 3660` 时分配 0 条。
+> 尾桶 `3147/1045429` 源报表显示 0.0%（四舍五入），此处按 0.01% 计入：约 1 万条请求出现 1 条超长输出（~1M token）批处理请求；`--num-requests 2160` 时分配 0 条。
 
 ## max_tokens 设置规则
 
-数据集中每条请求自带 `max_tokens`，决定该请求的 decode（生成输出）阶段多长。设置规则分两类：
+数据集中每条请求自带 `max_tokens`，决定该请求的 decode（生成输出）阶段多长。
 
-### 1. 普通请求（17 档）— 输入输出比不固定
+### 1. 普通请求（17 档）
 
-普通请求的 `max_tokens` 直接取自 `DISTRIBUTION` 常量中的输出值，输入输出比取决于真实流量画像（非固定比例）：
+直接取自 `DISTRIBUTION` 常量中的输出值，输入输出比取决于真实流量画像（非固定比例），如 125→74、1643→119、224544→846 等。
 
-| 输入 token | 输出 max_tokens |
-|---:|---:|
-| 125 | 74 |
-| 622 | 46 |
-| 999 | 1,218 |
-| 1,643 | 119 |
-| 2,624 | 167 |
-| 3,147 | 1,045,429 |
-| 4,979 | 184 |
-| 7,299 | 28,067 |
-| 8,958 | 411 |
-| 18,997 | 533 |
-| 31,130 | 430 |
-| 46,871 | 528 |
-| 66,476 | 622 |
-| 90,801 | 668 |
-| 120,954 | 744 |
-| 162,151 | 835 |
-| 224,544 | 846 |
+### 2. 预热桶请求
 
-> 3147/1045429 桶在 `--num-requests 3660` 时分配 0 条（0.01% 占比约 1 万条出现 1 条），实际不会出现。
-
-### 2. 渐进链请求 — 固定三档
-
-344158、499835 和 728183 桶的请求被替换为渐进链，链内各阶段的 `max_tokens` 由角色决定：
-
-| 阶段 | 角色 | max_tokens | 规则 |
+| 文件 | 角色 | max_tokens | 规则 |
 |---|---|---:|---|
-| Stage 0–5 | priming（预热缓存） | **16** | 固定极小值，只触发 prefill 写缓存，几乎不 decode |
-| 344158 桶 Stage 6 | target（目标请求） | **636** | = 该桶 DISTRIBUTION 输出值 |
-| 499835 桶 Stage 6 | target（目标请求） | **837** | = 该桶 DISTRIBUTION 输出值 |
-| 728183 桶 Stage 6 | target（目标请求） | **528** | = 该桶 DISTRIBUTION 输出值 |
+| 预热文件 | 前缀预热 | **16**（`--warmup-max-tokens`） | 固定极小值，只触发 prefill 写缓存，几乎不 decode |
+| 正式文件 | 完整长度请求 | **636 / 837 / 528** | = 该桶 DISTRIBUTION 输出值 |
 
-- **priming 的 16** 是经验值——足够触发 prefill（模型必须读取全部输入才能生成第 1 个 token），又足够短（16 token decode 只需几十毫秒），不会长时间占用 KV 缓存。
-- **target 的 636/837/528** 与该桶在 DISTRIBUTION 中的输出值一致，使渐进链不改变整体输出长度分布（priming 的 16 token 对整体输出分布影响 <1%）。
+### 3. 为什么 runner 的 `max_tokens` 必须为 None
 
-### 3. 为什么渐进链模式 `max_tokens` 必须为 None
-
-`run_perf.py` 中 `max_tokens` 是全局参数，会覆盖每行数据自带的值。设固定值（如 120000）会覆盖所有 1218 个 priming 请求的 16，使它们也生成 120000 token，**彻底破坏缓存命中机制**：
+`run_perf.py` / `run_perf_warmup.py` 中 `max_tokens` 是全局参数，会覆盖每行数据自带的值。设固定值（如 120000）会使预热请求也生成该长度：
 
 | 维度 | max_tokens=16（设计） | max_tokens=120000（被覆盖） |
 |---|---|---|
-| 单个 priming decode 耗时 | ~几十 ms | ~几十分钟 |
-| priming decode 产生的 KV | 16 token | 120000 token |
-| prefill 写入的前缀缓存 | 保留（decode KV 极小） | **被自己的 decode KV 挤出** |
-| Stage i+1 到达时 | 缓存在 → 命中 | 缓存被驱逐 → **无法命中** |
-| 1218 个 priming 总输出 | 19,488 token | 1.46 亿 token |
-| 全部跑完耗时 | ~3 分钟 | ~283 小时 |
+| 单条预热 decode 耗时 | ~几十 ms | ~几十分钟 |
+| prefill 写入的前缀缓存 | 保留 | **被自己的 decode KV 挤出** |
+| 正式测试命中 | ✅ | ❌ |
 
-因果链：
-
-```
-max_tokens=120000
-  → priming 请求 decode 120000 token
-  → decode 产生的 120000 个 KV 占满缓存
-  → prefill 阶段写入的输入前缀 KV 被 LRU 驱逐
-  → Stage i+1 到达时, 前缀缓存已不存在
-  → 缓存命中失败 → 渐进式前缀链完全失效
-```
-
-如果确实想用固定输出长度压测，应使用 `--no-chain` 禁用渐进链，降级为普通混合序列模式，那时设 `max_tokens=120000` 不会破坏任何机制（因为没有 priming 请求）。
+如果确实想用固定输出长度压测，可清空 `WARMUP_PAIRS` 只生成普通混合序列（此时无预热文件）。
 
 ## 环境要求与准备
 
@@ -294,16 +162,11 @@ max_tokens=120000
 
 推荐 Python 3.10 及以上版本。
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-```
-
-> 注意：部分环境只安装了 `python3`（没有 `python`），执行脚本时用 `python3 gen_data_4k_12k.py`。若使用 uv 管理环境，可用 `uv pip install --system <包名>` 直接安装到系统环境。
+> 注意：部分环境只安装了 `python3`（没有 `python`）。若使用 uv 管理环境，可用 `uv pip install --system <包名>` 或指定解释器路径（如 `/usr/local/uv/envs/llmcase/bin/python`）。
 
 ### 2. 安装依赖
 
-数据生成必需（`gen_data_4k_12k.py` 实际 import）：
+数据生成必需：
 
 ```bash
 python -m pip install --upgrade pip
@@ -314,7 +177,7 @@ python -m pip install transformers tiktoken datasets
 - `tiktoken`：transformers 加载失败时的回退分词器（cl100k_base）
 - `datasets`：未指定 `--gsm8k-path` 时从 HuggingFace 拉取 gsm8k
 
-EvalScope 压测需要（仅当 `--format evalscope` 且要实际跑压测时）：
+EvalScope 压测需要（仅当实际跑压测时）：
 
 ```bash
 python -m pip install 'evalscope[perf]==1.9.1'
@@ -328,7 +191,7 @@ PyTorch was not found. Models won't be available and only tokenizers ... can be 
 
 ### 3. 下载 DeepSeek V4 Flash Tokenizer
 
-生成器需要 V4 Flash 的 tokenizer 目录控制输入长度精度。**必须用绝对路径**传入 `--tokenizer`，否则会被当成在线仓库名导致加载失败。只需 tokenizer 文件（`tokenizer.json` + `tokenizer_config.json` + `config.json`），约 7.5MB，无需下载几十 GB 权重。
+生成器需要 V4 Flash 的 tokenizer 目录控制输入长度精度。**必须用绝对路径**传入 `--tokenizer`，否则会被当成在线仓库名导致加载失败。只需 tokenizer 文件（`tokenizer.json` + `tokenizer_config.json` + `config.json`），约 7.5MB。
 
 **方法一：HuggingFace 镜像（hf-mirror.com，国内推荐）**
 
@@ -348,14 +211,6 @@ modelscope download --model deepseek-ai/DeepSeek-V4-Flash \
   --local_dir ./deepseek-v4-flash-tokenizer
 ```
 
-**方法三：直连 HuggingFace（需能访问 huggingface.co）**
-
-```bash
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
-  --include "tokenizer*" "config.json" \
-  --local-dir ./deepseek-v4-flash-tokenizer
-```
-
 下载后验证：
 
 ```bash
@@ -367,111 +222,49 @@ print('编码示例:', tok.encode('Hello, how are you?', add_special_tokens=Fals
 "
 ```
 
-> 仓库名已核实：HuggingFace 和 ModelScope 均为 `deepseek-ai/DeepSeek-V4-Flash`。用错 tokenizer（如 V3.2 的）会导致实际 token 数与目标分布漂移。
-
 ### 4. 数据源
 
-目录已自带 `GSM8K.jsonl`（749KB，每行含 `question` 和 `answer`），通过 `--gsm8k-path "./GSM8K.jsonl"` 指定。不传时尝试从 HuggingFace 在线加载，需网络可达。
+目录已自带 `GSM8K.jsonl`（749KB，每行含 `question` 和 `answer`），通过 `--gsm8k-path "./GSM8K.jsonl"` 指定。
 
-## 快速生成 EvalScope 数据集
+## 快速生成数据集
 
-推荐命令：
+推荐命令（或直接 `bash gen_4k_12k.sh`）：
 
 ```bash
 python gen_data_4k_12k.py \
   --gsm8k-path "./GSM8K.jsonl" \
   --tokenizer "/apps/models/DeepSeek-V4-Flash/" \
-  --num-requests 3660 \
+  --num-requests 2160 \
   --cache-hit-rate 0.25 \
   --kv-block-size 128 \
   --concurrency 128 \
-  --min-chains 3 \
-  --chain-gap 128 \
+  --min-pairs 3 \
+  --warmup-output "./warmup_prefix.jsonl" \
   --format evalscope \
   --rate 4
 ```
 
-或直接使用便捷脚本：
+执行后生成：
 
-```bash
-bash gen_4k_12k.sh
-```
+- **预热文件** `warmup_prefix.jsonl`：15 条前缀请求（组数 = 按占比分配 + `--min-pairs` 提升）
+- **正式文件** `gsm8k_4k_12k_c128_cache25_<时间戳>.jsonl`：2160+ 条（20 档普通请求 + 预热桶完整长度请求）
+- `run_perf_warmup.py` / `run_perf.py`：两个压测 runner
 
-不指定 `--output` 时，脚本会使用时间和随机值生成唯一文件名，例如：
-
-```text
-gsm8k_4k_12k_c128_cache25_20260909_120000_a1b2c3d4.jsonl
-```
-
-同时会在数据集所在目录生成：
-
-```text
-evalscope_mixed_plugin.py
-run_perf.py
-```
-
-`--concurrency` 不会改变数据集内容，只会影响默认文件名和生成的 `run_perf.py` 中的 `parallel`。
+`--concurrency` 不会改变数据集内容，只会影响默认文件名和 runner 中的 `parallel`。
 
 ## 保证两次生成的数据不同
 
-`gen_data_4k_12k.py` 继承 ds-v3.2-12k 的块级批次隔离逻辑。
+每次不指定 `--body-salt` 时，脚本自动生成唯一盐值（`年月日_时分秒_随机十六进制`），用于：
 
-每次不指定 `--body-salt` 时，脚本自动生成唯一盐值：
+1. **每批重新排列 GSM8K 语料**：`SHA256(seed:body_salt)` 初始化独立随机顺序。
+2. **共享区每个块带批次标记**：`[shared-<batch_tag>-<block>]`，同批一致、跨批不同。
+3. **正文区每个块带唯一标记**：`[body-<batch_tag>-<rid>-<block>]`，不同批次/请求/块均不同。
+4. **预热/正式前缀文本随批次变化**：语料重排 + 批次标记继承到前缀对文本。
+5. **唯一输出文件名**：不指定 `--output` 时自动带时间戳+随机数。
 
-```text
-年月日_时分秒_随机十六进制
-```
+两次默认执行：完整请求文本、文件 SHA-256 均不同；长度档、请求数量、目标 25% 共享比例相同。
 
-该盐值用于对整批内容进行重新组织，而不只是修改开头的一段文本。
-
-### 1. 每批重新排列 GSM8K 语料
-
-脚本使用 `SHA256(seed:body_salt)` 初始化独立随机顺序，对 GSM8K 问题重新排列，再进行 tokenizer 编码。因此两批数据的正文问题顺序不同。
-
-### 2. 共享区每个块加入批次标记
-
-使用 `--kv-block-size 128` 时，共享区按 128 token 组织，每个块开头加入：
-
-```text
-[shared-批次标识-块编号]
-```
-
-同一批次的所有请求使用相同共享块，因此仍然产生目标约 25% 的批内共享前缀；不同批次的每个共享块都带不同批次标识。
-
-### 3. 非共享区每个块加入唯一标记
-
-25% 共享边界后的正文同样按 128 token 组织，每个块加入：
-
-```text
-[body-批次标识-请求编号-块编号]
-```
-
-标记同时包含批次、请求和块编号，因此不同批次、不同请求以及同一请求的不同正文块都不会生成相同的完整标记块。
-
-### 4. 共享区和正文使用不同起点
-
-脚本根据批次摘要分别计算共享语料偏移和正文语料偏移，并结合请求编号选择正文起点。即使两轮都使用同一个 `GSM8K.jsonl`，生成的长文本排列也不同。
-
-### 5. 渐进链的 segment 内容也随批次变化
-
-渐进链的 segment 用 `chain_idx × _ROTATE_PRIME` 计算不同语料偏移，且语料本身已按批次重新排列，因此不同批次的链段内容也不同。
-
-### 6. 唯一输出文件名
-
-未指定 `--output` 时，每轮都会生成不同名称的 JSONL 文件，不会覆盖上一轮数据。
-
-这些标记包含在原计划输入 token 长度中，不会额外增加输入长度。两次默认执行具有：
-
-- 不同 GSM8K 问题排列顺序。
-- 不同共享语料和正文偏移。
-- 不同共享块标记。
-- 不同正文块标记。
-- 不同渐进链 segment 内容。
-- 不同完整请求文本。
-- 不同输出文件名和文件 SHA-256。
-- 相同长度档、请求数量、输出长度分布和目标 25% 批内共享比例。
-
-注意：标记位于用户消息内容中。如果服务端在用户内容前插入超过一个完整 KV block 的固定 Chat Template 或系统提示，这些固定模板块仍可能跨批次命中。需要严格隔离整个服务端 Prompt 时，应使用服务端原生请求级缓存盐值，或在每轮压测前清理 Prefix Cache。
+注意：若服务端在用户内容前插入超过一个完整 KV block 的固定 Chat Template 或系统提示，这些固定模板块仍可能跨批次命中。需要严格隔离时应使用服务端原生请求级缓存盐值，或在每轮压测前清理 Prefix Cache。
 
 ## 输出格式
 
@@ -481,156 +274,60 @@ run_perf.py
 
 ```json
 {
-  "messages": [
-    {
-      "role": "user",
-      "content": "生成的混合序列文本"
-    }
-  ],
+  "messages": [{"role": "user", "content": "生成的混合序列文本"}],
   "max_tokens": 1760,
   "ignore_eos": true,
   "stream": true
 }
 ```
 
-渐进链阶段的请求格式相同，但 `max_tokens` 不同：
-
-- 中间阶段（priming）：`"max_tokens": 16`
-- 目标阶段：344158 桶 = 636、499835 桶 = 837、728183 桶 = 528
-
-每条请求携带自己的 `max_tokens`，因此 `run_perf.py` 中必须保持：
-
-```python
-max_tokens=None
-```
-
-否则 EvalScope 的全局输出长度可能覆盖数据集中的逐请求输出长度。特别是**不能设固定值**，否则 priming 阶段也会生成该长度，完全失去 priming 意义。
+预热文件每行 `max_tokens: 16`；正式文件中预热桶完整长度请求的 `max_tokens` 为该桶目标值（636/837/528）。
 
 ### AISBench
 
-每行格式：
-
-```json
-{
-  "question": "生成的混合序列文本",
-  "answer": "none",
-  "max_tokens": 1760
-}
-```
+每行格式：`{"question": "...", "answer": "none", "max_tokens": 1760}`
 
 ## 使用 EvalScope 压测
 
-生成数据后，目录下会有三个 `run_perf` 脚本（参考 ds-v3.2-12k 的三件套结构）：
-
-| 脚本 | 来源 | 用途 |
-|---|---|---|
-| `run_perf.py` | 生成器自动生成 | 模板，`model/url/tokenizer_path` 是占位符，需改后使用 |
-| `run_perf1.py` | 手动创建 | 配置 1：低速率验证（rate=1，先确认服务与请求格式正常） |
-| `run_perf2.py` | 手动创建 | 配置 2：中速率压测（rate=4，吞吐更高） |
-
-### run_perf.py（模板，自动生成）
-
-```python
-args = Arguments(
-    model="deepseek-v4-flash",
-    ...
-    number=3798,        # 必须包含 priming 请求数
-    parallel=128,
-    rate=4,             # 渐进链模式: 必须 >0, 不能用 -1
-    max_tokens=None,    # 别改: None 才逐请求生效
-    ...
-)
-```
-
-### run_perf1.py（配置 1：低速率验证）
-
-```python
-args = Arguments(
-    model="deepseek-v4-flash",
-    api="openai",
-    url="http://localhost:8099/v1/chat/completions",
-    dataset="mixed",
-    dataset_path='/workspace/llm-testcase-creator/ds-v4-12k/gsm8k_4k_12k_c128_cache25_20260910_072644_53b9b8de.jsonl',
-    tokenizer_path="/apps/models/DeepSeek-V4-Flash/",
-    number=4878,
-    parallel=128,
-    rate=1,           # 低速率先验证
-    max_tokens=None,  # 别改: None 才逐请求生效 (priming=16, target=636/837/528)
-    stream=True,
-    name="mix_perf",
-)
-```
-
-### run_perf2.py（配置 2：中速率压测）
-
-```python
-args = Arguments(
-    model="deepseek-v4-flash",
-    api="openai",
-    url="http://localhost:8098/v1/chat/completions",
-    dataset="mixed",
-    dataset_path='/workspace/llm-testcase-creator/ds-v4-12k/gsm8k_4k_12k_c128_cache25_20260910_072644_53b9b8de.jsonl',
-    tokenizer_path="/apps/models/DeepSeek-V4-Flash/",
-    number=4878,
-    parallel=128,
-    rate=4,           # 中速率压测
-    max_tokens=None,  # 别改: None 才逐请求生效 (priming=16, target=636/837/528)
-    stream=True,
-    name="mix_perf",
-)
-```
-
-### 与 ds-v3.2-12k 的 run_perf 脚本差异
-
-| 项 | ds-v3.2-12k run_perf1/2 | ds-v4-12k run_perf1/2 |
-|---|---|---|
-| `max_tokens` | `120000`（固定输出长度） | **`None`**（逐请求生效，渐进链必须） |
-| `rate` | `1` / `1.56` | `1` / `4` |
-| `number` | `1220` / `2620`（= num-requests） | `4878`（= num-requests + priming） |
-| `parallel` | `122` / `262` | `128` |
-| `model` | `deepseek` | `deepseek-v4-flash` |
-| `tokenizer_path` | V3.2 权重目录 | V4 Flash 权重目录 |
-
-> v3.2-12k 的 run_perf1/2 用 `max_tokens=120000` 统一覆盖输出长度，因为它没有渐进链（无 priming）。v4-12k **必须用 `None`**，否则 priming 的 16 会被覆盖成 120000，缓存命中机制失效。
-
-### 运行
-
 ```bash
 export OPENAI_API_KEY="你的API_KEY"
-python3 run_perf1.py   # 低速验证
-python3 run_perf2.py   # 中速压测
+
+# 1. 预热: 把前缀 KV 写入服务端 prefix cache
+python run_perf_warmup.py
+
+# 2. 正式: 长请求命中预热前缀
+python run_perf.py
 ```
 
-两套配置（rate=1 vs rate=4）用于对比不同到达速率下渐进链的缓存命中率和 TTFT 表现。
+runner 关键参数（生成时已填好）：
 
-### 渐进链模式的关键约束
+| 参数 | 预热 runner | 正式 runner |
+|---|---|---|
+| `dataset_path` | warmup_prefix.jsonl | 正式文件 |
+| `number` | 预热请求数（如 15） | 正式请求数（如 2161） |
+| `parallel` | `--concurrency` | `--concurrency` |
+| `rate` | `--rate` | `--rate` |
+| `max_tokens` | **None**（必须） | **None**（必须） |
+
+### 关键约束
 
 | 参数 | 要求 | 原因 |
 |---|---|---|
-| `rate` | **必须 > 0** | rate=-1（闭环并发）使 stage 时序不可控，后阶可能在前阶 prefill 完成前到达 |
-| `max_tokens` | **必须 None** | 设固定值会使 priming 阶段也生成该长度，失去 priming 意义（详见上节"为什么渐进链模式 max_tokens 必须为 None"） |
-| `number` | **必须含 priming** | 减少 number 会截断链阶段，破坏前缀链 |
-| `parallel` | ≥ `--chain-gap` | 确保间隔请求能填满并发窗口 |
+| `max_tokens` | **必须 None** | 设固定值会使预热请求也生成该长度，前缀缓存被自己的 decode KV 挤出，正式测试无法命中 |
+| 服务实例 | 预热与正式**同一实例** | 实例重启缓存丢失 |
+| 时序 | 预热完成后尽快跑正式 | 减少缓存被中间流量冲刷的窗口 |
+| 缓存容量 | ≥ 全部预热 KV | 否则预热自逐出 |
 
-建议先使用小规模请求验证：
-
-```python
-number=100
-parallel=32
-rate=1
-```
-
-确认成功率和请求格式正常后，再逐步提高 `number`、`parallel` 和 `rate`。
-
-数据中长输入请求较多，最长输入达到 `728183 tokens`（+528 输出）。设置请求速率时，需要同时考虑长请求带来的连接占用时间，避免使用过大的 `parallel` 和 `rate` 导致网关主动断开连接。
+建议先小规模验证（`--num-requests 100 --min-pairs 3`），确认成功率后再逐步提高。
 
 ## 使用 AISBench 压测
 
 ```bash
-ais_bench --models <your_model> \
-  --custom-dataset-path <generated.jsonl> \
-  --custom-dataset-data-type qa \
-  --max-out-len -1
+# 先预热后正式
+ais_bench --models <your_model> --custom-dataset-path warmup_prefix.jsonl \
+  --custom-dataset-data-type qa --max-out-len -1
+ais_bench --models <your_model> --custom-dataset-path <formal.jsonl> \
+  --custom-dataset-data-type qa --max-out-len -1
 ```
 
 `--max-out-len -1` 表示使用数据集中每条请求自己的 `max_tokens`。
@@ -639,271 +336,78 @@ ais_bench --models <your_model> \
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
-| `--num-requests` | `2500` | 生成的请求总数（不含 priming） |
-| `--concurrency` | `32` | 仅影响默认文件名和生成的 EvalScope `parallel` |
-| `--cache-hit-rate` | `0.25` | 每条请求中计划共享的前缀比例，范围 `[0, 1)` |
+| `--num-requests` | `2500` | 正式文件请求总数 |
+| `--concurrency` | `32` | 仅影响默认文件名和 runner 的 `parallel` |
+| `--cache-hit-rate` | `0.25` | 共享前缀占每条 prompt 的比例，范围 `[0, 1)` |
 | `--gsm8k-path` | 空 | 本地 GSM8K JSONL；不指定则尝试从 Hugging Face 加载 |
 | `--tokenizer` | 空 | Hugging Face tokenizer 名称或本地权重目录 |
-| `--kv-block-size` | `0` | 大于 0 时将共享前缀和链阶段对齐到完整 KV block |
-| `--output` | 自动生成 | 输出 JSONL 文件路径 |
+| `--kv-block-size` | `0` | >0 时把共享前缀和预热/正式长度对齐到完整 KV block |
+| `--output` | 自动生成 | 正式文件输出 JSONL 路径 |
+| `--warmup-output` | 自动生成 | 预热文件输出 JSONL 路径 |
 | `--format` | `aisbench` | 输出格式：`aisbench` 或 `evalscope` |
-| `--body-salt` | 自动生成 | 批次唯一值，控制语料重排、共享块标记、正文块标记和语料偏移 |
+| `--body-salt` | 自动生成 | 批次唯一值，控制语料重排、共享块标记、正文块标记 |
 | `--seed` | `42` | 控制请求打乱顺序，并参与共享语料偏移计算 |
-| `--chain-buckets` | `344158,499835,728183` | 做渐进链的桶输入长度，逗号分隔；在 `CHAIN_BUCKETS` 常量中已定义阶段的桶直接复用，其余按 `--chain-num-stages` 自动均分 |
-| `--chain-num-stages` | `7` | 自动生成阶段数，仅对未在 `CHAIN_BUCKETS` 常量定义阶段的桶生效 |
-| `--chain-gap` | `0` (auto) | 链 stage 间间隔的普通请求数；0=自动取 concurrency |
-| `--chain-intermediate-output` | `16` | 链中间阶段输出 tokens（priming） |
-| `--min-chains` | `3` | 每个链桶的最少链数，不足时自动提升 |
-| `--no-chain` | `False` | 禁用渐进式前缀链，降级为 12k 行为 |
-| `--rate` | `4.0` | EvalScope rate 参数（生成 run_perf.py 用；渐进链模式必须 >0） |
-
-> 想精细控制某个桶的链阶段长度，改 `gen_data_4k_12k.py` 顶部 `CHAIN_BUCKETS` 常量；想快速增删哪些桶做链，用 `--chain-buckets`。
-
-## 渐进链工作原理详解
-
-### 1. 名额分配与链数提升
-
-`--num-requests 3660` 时，各链桶按占比分配链数，`--min-chains 3` 保证每个链桶至少 3 条链：
-
-```
-344158 桶 (0.36%) = 13 链 (无需提升)
-499835 桶 (0.18%) = 7 链  (无需提升)
-728183 桶 (0.09%) = 3 链  (无需提升)
-总链数 = 23
-普通请求 = 3660 - 23 = 3637
-链请求 = 23 × 7 阶段 = 161 (含 priming = 23 × 6 = 138)
-总请求 = 3637 + 161 = 3798
-```
-
-### 2. 每桶 token 序列构造
-
-```
-344158 桶: full_seq = [shared_prefix (86016 tok)] [\n] [chain_segments (~258k tok)] = 344158 tok
-499835 桶: full_seq = [shared_prefix (124928 tok)] [\n] [chain_segments (~375k tok)] = 499835 tok
-728183 桶: full_seq = [shared_prefix (182016 tok)] [\n] [chain_segments (~546k tok)] = 728183 tok
-                ↑ 固定长度 = 25% × 桶长度, block 对齐
-```
-
-### 3. 阶段截断 (block 对齐)
-
-```
-344158 桶: [49152, 98304, 147456, 196608, 245760, 294912, 344064]
-499835 桶: [71296, 142720, 214144, 285568, 356992, 428416, 499712]
-728183 桶: [103936, 208000, 312064, 416000, 520064, 624128, 728064]
-```
-
-### 4. 前缀验证
-
-```python
-for i in range(6):
-    stage_i_tokens = tok.encode(stage_texts[i])
-    stage_next_tokens = tok.encode(stage_texts[i+1])
-    assert stage_next_tokens[:len(stage_i_tokens)] == stage_i_tokens
-```
-
-### 5. 交错排列 (所有链桶统一)
-
-```
-[gap×normal], 链0_s0, 链1_s0, ..., 链22_s0,    # 23条链的Stage 0 (344158桶13条 + 499835桶7条 + 728183桶3条)
-[gap×normal], 链0_s1, 链1_s1, ..., 链22_s1,    # 23条链的Stage 1
-...
-[gap×normal], 链0_s6, 链1_s6, ..., 链22_s6,    # 23条链的Stage 6 (目标)
-[remaining normal]
-```
-
-`gap = --chain-gap`（默认 128），确保 Stage i 的 prefill 完成（写缓存）后 Stage i+1 才到达。
-
-### 6. 链定位公式
-
-生成数据集（`--num-requests 3660 --concurrency 128 --chain-gap 128`）后，交错排列的结构固定，可用公式定位任意链的任意阶段在 jsonl 文件中的行号：
-
-```
-链 k 的 stage i 行号(1-based) = gap + 1 + (gap + num_chains) × i + k
-                              = 128 + 1 + (128 + 23) × i + k
-                              = 129 + 151 × i + k
-```
-
-其中 `num_chains = 23`（344158 桶 13 + 499835 桶 7 + 728183 桶 3），`gap = 128`。
-
-- **344158 桶链**：k = 0..12
-- **499835 桶链**：k = 13..19
-- **728183 桶链**：k = 20..22
-
-示例（344158 桶第一条链，k=0）：
-
-| Stage | 公式 | 行号 | max_tokens |
-|:---:|---|:---:|---:|
-| s0 | 129 + 151×0 + 0 | 129 | 16 |
-| s1 | 129 + 151×1 + 0 | 280 | 16 |
-| s2 | 129 + 151×2 + 0 | 431 | 16 |
-| s3 | 129 + 151×3 + 0 | 582 | 16 |
-| s4 | 129 + 151×4 + 0 | 733 | 16 |
-| s5 | 129 + 151×5 + 0 | 884 | 16 |
-| s6 | 129 + 151×6 + 0 | 1035 | 636 |
-
-同一链相邻 stage 间隔 151 行（= gap 128 + 链总数 23）。
-
-### 7. 实际生成的 max_tokens 分布
-
-`--num-requests 3660` 生成后，jsonl 文件的 `max_tokens` 分布：
-
-```
-max_tokens   数量    来源
-16           138     priming (23链 × 6阶段)
-46           474     普通请求 (622输入桶)
-74           223     普通请求 (125输入桶)
-119          1146    普通请求 (1643输入桶)
-167          694     普通请求 (2624输入桶)
-184          353     普通请求 (4979输入桶)
-411          108     普通请求 (8958输入桶)
-430          87      普通请求 (31130输入桶)
-528          83      普通请求 (46871桶80) + 链target (728183桶3)
-533          66      普通请求 (18997输入桶)
-622          79      普通请求 (66476输入桶)
-636          13      344158桶链 target
-668          76      普通请求 (90801输入桶)
-744          61      普通请求 (120954输入桶)
-835          34      普通请求 (162151输入桶)
-837          7       499835桶链 target
-846          20      普通请求 (224544输入桶)
-1218         135     普通请求 (999输入桶)
-28067        1       普通请求 (7299输入桶)
-─────────────────────
-总计         3798    (3637普通 + 161链阶段)
-```
-
-## 降级模式
-
-使用 `--no-chain` 可禁用渐进式前缀链，降级为与普通混合序列一致的行为：
-
-```bash
-python gen_data_4k_12k.py --no-chain --format evalscope
-```
-
-此时 344158/499835/728183 桶使用普通请求（含 `[body-<batch>-<rid>-<block>]` 标记），无 priming，无交错排列，`run_perf.py` 可使用 `rate=-1`。
-
-## 与 ds-v3.2-12k 和 ds-v4-3k 的区别
-
-| 维度 | ds-v3.2-12k | ds-v4-3k | **ds-v4-12k** |
-|---|---|---|---|
-| 目标模型 | DeepSeek V3.2 | DeepSeek V4 Flash | DeepSeek V4 Flash |
-|  平均输入 | ~12349 tok | ~3038 tok | ~14900 tok |
-| 分布档数 | 10 档 | 10 档 | 20 档（rr=5/21机 画像） |
-| 默认 cache 率 | 25% | 15% | 25% |
-| 批次隔离 | 块级标记 | 单一 req 标记 | 块级标记（同 12k） |
-| 344158 桶处理 | 单一请求 | — | **7 阶渐进链** |
-| 42100 桶处理 | 单一请求 | — | — |
-| 499835 桶处理 | — | — | **7 阶渐进链** |
-| 70000 桶处理 | — | 7 阶渐进链 | — |
-| 84200 桶处理 | 单一请求 | 7 阶渐进链 | — |
-| 728183 桶处理 | — | — | **7 阶渐进链** |
-| 缓存命中机制 | 仅 25% 共享前缀 | 15% 共享 + 链内前缀命中 | **25% 共享 + 三桶链内前缀命中** |
-| priming 请求 | 无 | 每链 6 个 | 每链 6 个 |
-| run_perf rate | 可用 -1 | 必须 > 0 | 必须 > 0 |
-| run_perf max_tokens | None (建议) | 必须 None | 必须 None |
-| run_perf number | = num-requests | = num-requests + priming | = num-requests + priming |
+| `--warmup-pairs` | `344158:292864,...` | 预热/正式前缀对，`正式:预热` 格式逗号分隔 |
+| `--min-pairs` | `3` | 每个预热桶的最少前缀对组数，不足时自动提升 |
+| `--warmup-max-tokens` | `16` | 预热请求输出 tokens（decode 长度） |
+| `--rate` | `4.0` | EvalScope rate 参数（写入两个 runner） |
 
 ## 生成结果检查
 
-查看文件数量和第一条数据：
-
 ```bash
-wc -l <generated.jsonl>
-head -n 1 <generated.jsonl> | jq .
-```
+# 预热文件: 应全部 max_tokens=16
+jq -r '.max_tokens' warmup_prefix.jsonl | sort -n | uniq -c
 
-查看输出长度分布：
+# 正式文件: 应有 636/837/528 三档 target, 无 16 (无 priming)
+jq -r '.max_tokens' <formal.jsonl> | sort -n | uniq -c
 
-```bash
-jq -r '.max_tokens' <generated.jsonl> | sort -n | uniq -c
-```
-
-检查渐进链阶段（应看到 `max_tokens: 16` 的 priming 请求，以及三档 target）：
-
-```bash
-jq -r '.max_tokens' <generated.jsonl> | sort -n | uniq -c
-# 3660 请求数时应包含:
-#   138  16        ← 23 链 × 6 priming
-#    13  636       ← 344158 桶链 × 1 target
-#     7  837       ← 499835 桶链 × 1 target
-#     3  528       ← 728183 桶链 × 1 target
-```
-
-定位一条完整链的 7 个阶段行号（用链定位公式）：
-
-```bash
-# 344158 桶第一条链 (k=0), 7 个阶段的行号:
-# s0=129, s1=280, s2=431, s3=582, s4=733, s5=884, s6=1035
-# 同一链相邻 stage 间隔 151 行 (= gap 128 + 链总数 23)
-for line in 129 280 431 582 733 884 1035; do
-  sed -n "${line}p" <generated.jsonl> | jq -r '.max_tokens'
-done
-# 应输出: 16 16 16 16 16 16 636
-```
-
-验证链的前缀关系（Stage i 是 Stage i+1 的前缀）：
-
-```bash
+# 跨文件前缀验证: 每条预热请求应是正式文件中某条长请求的前缀
 python3 -c "
 import json
-from transformers import AutoTokenizer
-lines = [json.loads(l) for l in open('<generated.jsonl>') if l.strip()]
-tok = AutoTokenizer.from_pretrained('./deepseek-v4-flash-tokenizer', trust_remote_code=True)
-stages = [lines[p-1]['messages'][0]['content'] for p in [129,280,431,582,733,884,1035]]
-tok_stages = [tok.encode(s, add_special_tokens=False) for s in stages]
-for i in range(6):
-    ok = tok_stages[i+1][:len(tok_stages[i])] == tok_stages[i]
-    print(f's{i}→s{i+1}: {\"✓\" if ok else \"✗ 漂移\"} ({len(tok_stages[i])}/{len(tok_stages[i])} token)')
+w = [json.loads(l) for l in open('warmup_prefix.jsonl') if l.strip()]
+f = [json.loads(l) for l in open('<formal.jsonl>') if l.strip()]
+ok = sum(1 for wr in w if any(
+    len(fr['messages'][0]['content']) >= len(wr['messages'][0]['content'])
+    and fr['messages'][0]['content'][:len(wr['messages'][0]['content'])] == wr['messages'][0]['content']
+    for fr in f))
+print(f'前缀匹配 {ok}/{len(w)}')
 "
 ```
 
-对比两批数据文件是否不同：
-
-```bash
-shasum -a 256 batch-A.jsonl batch-B.jsonl
-```
+对比两批数据文件是否不同：`shasum -a 256 batch-A.jsonl batch-B.jsonl`
 
 ## 常见问题
 
-### 渐进链 priming 请求生成了 636/837/528 tokens
-
-检查 `run_perf.py` 中的 `max_tokens`。必须为 `None`，不能是固定值。`None` 让数据集中每条请求自带的 `max_tokens` 生效（priming=16，344158 桶 target=636，499835 桶 target=837，728183 桶 target=528）。
-
-### 渐进链缓存命中率低
+### 正式测试长请求 TTFT 没有下降
 
 可能原因：
 
-- `rate=-1`（闭环并发）：stage 时序不可控，后阶在前阶 prefill 完成前到达。改为 `rate=N`（N>0）。
-- `--chain-gap` 过小：stage 间隔不足，前阶 prefill 未完成。保持 `--chain-gap=0`（auto=concurrency）或增大。
-- `--kv-block-size` 与服务端不一致：阶段边界不对齐，缓存部分命中。确认服务端 KV block 大小。
+- 预热 runner 没先跑，或跑在不同服务实例上。
 - 服务端未开启 Prefix Caching。
-- 服务端缓存不足，早期 stage 被驱逐。
-- 不同链请求被路由到不共享缓存的不同实例。
+- 服务端缓存容量不足，预热 KV 被逐出（检查容量 ≥ 预热 KV 总量）。
+- 预热与正式之间隔了太久，中间流量冲刷掉缓存。
+- `max_tokens` 设了固定值（必须 None），预热 decode 把前缀 KV 挤出。
+
+### 实际缓存命中率与 25% 不一致
+
+- `--kv-block-size` 与服务端 KV block 大小不一致。
+- Chat Template 或系统提示增加了额外固定 token。
+- 第一条请求需要写入缓存，本身不能命中。
+- 请求被路由到没有共享缓存的实例。
 
 ### tokenizer 被当成在线模型仓库
 
-使用完整绝对路径：
-
-```bash
---tokenizer "/apps/models/DeepSeek-V4-Flash"
-```
+使用完整绝对路径：`--tokenizer "/apps/models/DeepSeek-V4-Flash"`
 
 ### 出现 `Connection reset by peer`
 
-通常表示网关、代理或模型服务主动断开连接。先降低压力：
-
-```python
-number=100
-parallel=32
-rate=1
-```
+降低压力：`number=100, parallel=32, rate=1`，确认成功后逐步提高。
 
 ## 注意事项
 
 - 长度为脚本 tokenizer 测得的用户文本长度，服务端 Chat Template 可能增加额外输入 token。
-- 最长档为 `728183 input + 528 output`，不含 Chat Template 时总长度达到 `728711 tokens`。
-- 服务端最大上下文长度需要大于最长输入、输出和 Chat Template token 的总和。
-- `ignore_eos=true` 需要服务端兼容，否则可能被忽略或返回参数错误。
-- 渐进链的 priming 请求（16 tokens 输出）会略微改变整体输出 token 分布，但影响 <1%。
+- 最长档为 `728183 input + 528 output`，服务端最大上下文需覆盖输入、输出和 Chat Template token 总和。
+- `ignore_eos=true` 需要服务端兼容。
+- 预热请求（16 tokens 输出）会略微改变整体输出 token 分布，但影响 <1%。
 - 不要把 API Key 明文提交到脚本或代码仓库，推荐通过环境变量传入。
-- 渐进链模式是**缓存命中基准测试**，不是对话保真度测试。真实 agent 对话有助手响应、工具调用、角色标记等额外 token，本方案未模拟这些。
+- 预热/正式双文件模式是**缓存命中基准测试**，不是对话保真度测试。真实 agent 对话有助手响应、工具调用、角色标记等额外 token，本方案未模拟这些。
