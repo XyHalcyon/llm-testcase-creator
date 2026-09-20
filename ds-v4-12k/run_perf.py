@@ -16,9 +16,9 @@ args = Arguments(
     api="openai",
     url="http://<HOST>:<PORT>/v1/chat/completions",
     dataset="mixed",
-    dataset_path='/workspace/llm-testcase-creator/ds-v4-12k/gsm8k_4k_12k_c128_cache25_20260919_164926_fcf9e5e1.jsonl',
+    dataset_path='/workspace/llm-testcase-creator/ds-v4-12k/gsm8k_4k_12k_c128_cache25_20260920_015817_992243bf.jsonl',
     tokenizer_path="<tokenizer 或权重目录>",
-    number=2161,
+    number=2160,
     parallel=128,
     rate=4.000000,
     max_tokens=None,      # 别改: None 才逐请求生效 (预热桶 target=636/837/528)
