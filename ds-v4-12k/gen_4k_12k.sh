@@ -8,7 +8,7 @@
   --cache-hit-rate 0.25 \
   --kv-block-size 128 \
   --concurrency 128 \
-  --min-pairs 3 \
+  --min-pairs 2 \
   --warmup-output "./warmup_prefix.jsonl" \
   --format evalscope \
   --rate 4
